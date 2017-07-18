@@ -1,0 +1,686 @@
+---
+title: "Predicting Ticket Sales for the MLB - Model Selection"
+output:
+  html_document: default
+    toc: TRUE
+  pdf_document: default
+    toc: TRUE
+---
+
+# Load Packages, Read External Data Sources, and Set Parameters
+
+We begin by clearing any lingering objects and loading all required packages.
+```{r}
+# Clear objects to preempt errors 
+rm(list = ls())
+
+# Load packages
+pacman::p_load(tidyverse, caret, dplyr, stringr, lubridate, XML, readxl, glmnet, xgboost, boot, pander, randomForest, zoo)
+
+```
+
+
+Next, we load the datasets we've been given.
+```{r}
+
+# Load individual-level ticket sales data
+sales_data <- read.csv('tblTDC_SalesDetails_Wharton.csv')
+
+# Load schedule master
+schedule_master <- read.csv('Multi_Season_Schedule_Master - Updated.csv')
+
+# Read-in 2016 projections from Rocky and organize
+project2016 <- read_excel('2016 Building Block Initial Projections.xlsx', sheet = 1)
+  project2016 <- project2016 %>%
+    gather(buyer_type_group_code, ntix, Season:Total) %>%
+    filter(buyer_type_group_code == "Single " | buyer_type_group_code == "Groups" | buyer_type_group_code == "Spec Evt")
+  
+  # Rename columns in projections file
+  names(project2016) <- c('date', 'opp_code', 'time', 'result', 'day_type', 'buyer_type_group_code', 'ntix')
+  
+  # Add 'year' column and select the variables we care about
+  project2016 <- project2016 %>%
+    mutate(date = mdy(date),
+           year = 2016) %>%
+    dplyr::select(year, date, opp_code, buyer_type_group_code, ntix)
+    
+# Load Special Event Mappings
+spcevts <- read_excel('Special Event Categories.xls', sheet = 1)
+
+
+```
+
+Here, the user should set parameters for use throughout the rest of the code.
+```{r}
+# Set year range for data scrape (we'd generally recommend using the previous two seasons)
+year_range <- 2015:2016
+
+# Set start of first season used for modeling (should be the start of your earliest season selected in year_range)
+season_start <- ymd('2015-04-13')
+
+# Select groups we care about. We only examined SINGLE, GROUP, and SPCEVT for our purposes, but our code should be able to take in other buyer types as well
+tix_type <- c("SINGLE", "GROUP", "SPCEVT")
+
+# Set the variables used for modeling (NOTE: time covariates such as day_diff and last_week also need to be added to grouping code at line 384)
+model_variables <- c("ntix", "opp_code", "month", "day", "day_night", "mlb_homespan")
+
+# Set image directory
+img_dir <- "C:\\Users\\nthor\\Desktop\\Wharton\\Analytics\\redacted\\Images\\"
+
+# Set number of training / test samples to use
+num_its <- 10
+```
+
+# Data Cleaning and Feature Creation
+
+We address missing values, standardize our column names, parse all of our date variables, and add other indicators that can be pulled immediately from our dataset.
+```{r}
+
+# Join datasets on event ID
+sales_master <- sales_data %>%
+  left_join(schedule_master, c("EVENT_CODE" = "Event.Code"))
+
+# Remove any NA rows
+sales_master <- sales_master[!is.na(sales_master$Date), ]
+
+# Fix naming error
+colnames(sales_master)[1] <- "EVENT_DATE"
+
+# Rename columns to standardize naming conventions
+sales_master <- rename(sales_master, event_date = EVENT_DATE,
+                                          seat_id = SEAT_ID, 
+                                          ticket_id = TICKET_ID, 
+                                          res_code_id = RESERVATION_CODE_ID, 
+                                          event_code = EVENT_CODE,
+                                          event_desc = EVENTDESC, 
+                                          buyer_type = BUYERTYPE,
+                                          buyer_type_desc = BUYERTYPEDESC,
+                                          buyer_type_group_code = BUYER_TYPE_GROUP_CODE,
+                                          price_scale_code = PRICE_SCALE_CODE,
+                                          trans_date = TRANSACTION_DATE,
+                                          orig_trans_date = ORIGINAL_TRANSACTION_DATE,
+                                          total_price = TOTAL_PRICE,
+                                          reg_patron_id = REGISTERED_PATRON_ACCOUNT_ID,
+                                          date = Date,
+                                          date_str = Date_String,
+                                          day = Day,
+                                          month = Month,
+                                          month_type = Month_Type,
+                                          day_night = Day.Night,
+                                          day_type = Day_Type,
+                                          opp = Opp,
+                                          opp_type = Opp_Type,
+                                          time = Time,
+                                          result = Result,
+                                          spec_event = Special.Event,
+                                          giveaway = Giveaway,
+                                          tix_promo = Tix.Promo,
+                                          other = Other,
+                                          minipack = MiniPack
+)                     
+
+
+# Parse timestamps
+sales_master <- sales_master %>%
+  mutate(event_date      = ymd_hms(event_date),
+         trans_date      = ymd_hms(trans_date),
+         orig_trans_date = ymd_hms(orig_trans_date)
+         )
+
+# Parse date features (note: here we define "night" as being after 5PM)
+sales_master <- sales_master %>%
+  mutate(date      = as_date(event_date),
+         day       = wday(date, label = TRUE),
+         month     = month(date, label = TRUE),
+         day_night ='Day',
+         day_night = replace(day_night, hour(event_date) >= 17, 'Night'), # After 5 PM
+         buy_date  = as_date(orig_trans_date),
+         time      = paste0(sprintf('%02d', hour(event_date)), ':',
+                            sprintf('%02d', minute(sales_master$event_date))),
+         day_diff  = as.integer(buy_date - date)
+         )
+
+sales_master <- sales_master %>% # Address day_diff > 0
+  mutate(day_diff = replace(day_diff, day_diff > 0, 0))
+
+# Create time covariates
+sales_master <- sales_master %>%
+  mutate(year      = year(date),
+         week_diff = floor(day_diff / 7),
+         last_week = day_diff,
+         last_week = replace(last_week, day_diff < -7, 'No')
+         )
+
+# Create WeekDay/WeekEnd/LateWeek indicator
+sales_master <- sales_master %>% # Day type categorical
+  mutate(day_type = 'WeekDay',
+         day_type = replace(day_type, day %in% c('Sat', 'Sun'), 'WeekEnd'),
+         day_type = replace(day_type, day %in% c('Thurs', 'Fri'), 'LateWeek'),
+         day_type = replace(day_type, day %in% c('Mon', 'Tues', 'Wed') & hour(event_date) >= 17, 'WeekNight')
+         )
+
+# Correct opponent codes
+sales_master <- sales_master %>% # ONLY needed when using Sales_Master source data file
+  rename(opp_code = opp) %>% 
+  mutate(opp_code = as.character(opp_code),
+         opp_code = replace(opp_code, opp_code == 'CWS', 'CHW'),
+         opp_code = replace(opp_code, opp_code == 'SD', 'SDP'),
+         opp_code = replace(opp_code, opp_code %in% c('WAS', 'WSH'), 'WSN'))
+
+# Create "division rivals" indicator
+div_rivals <- c('redacted')
+sales_master <- sales_master %>%
+  mutate(div_rival = 'No',
+         div_rival = replace(div_rival, opp_code %in% div_rivals, 'Yes'))
+
+# Dynamically create opening day indicator
+open_day <- sales_master %>%
+  filter(str_detect(event_code, 'RS')) %>%
+  group_by(year) %>%
+  summarize(opening_day = min(date))
+
+sales_master <- sales_master %>%
+  mutate(opening_day = 'No',
+         opening_day = replace(opening_day, date %in% open_day$opening_day, 'Yes'))
+
+spcevts <- spcevts %>%
+  mutate(date = ymd(date))
+
+sales_master <- sales_master %>%
+  left_join(spcevts %>% dplyr::select(date, buyer_type, spc_event_cat), by = c('date', 'buyer_type'))
+
+# Remove whitespace between text (necessary step for model building)
+sales_master <- sales_master %>%
+  mutate(result = str_replace_all(result, ' ', '_')) %>% 
+  mutate(spc_event_cat = str_replace_all(spc_event_cat, ' ', '_'))
+
+unique(sales_master$spc_event_cat)
+
+# Check for missing special event categories
+missing_special <- sales_master %>% 
+  filter(year >= 2015, buyer_type_group_code == 'SPCEVT') %>% 
+  group_by(event_code, date, 
+           buyer_type, buyer_type_desc, buyer_type_group_code, spc_event_cat) %>%
+  summarize(ntix = n())
+
+# Missing special event categories won't be used in our model. The mappings can be easily updated using the "Special Event Categories" Excel file
+```
+
+We scrape homespan data from Baseball-Reference.com and use this data to create additional features for testing.
+```{r}
+
+# Define list of teams
+gamedata <- data.frame()
+team_list  <- c("ARI","ATL","BAL","BOS","CHC","CHW","CIN","CLE","COL","DET","HOU",
+                 "KCR","LAA","LAD","MIA","MIL","MIN","NYM","NYY","OAK","PHI","PIT",
+                 "SDP","mlb","SEA","STL","TBR","TEX","TOR","WSN")
+
+# Run loop to pull data for the years we care about (defined using year_range parameter)
+for (years in year_range){
+  for (team in team_list){
+    
+    # Access web-page
+    link <- paste("http://www.baseball-reference.com/teams/",team,"/",years,
+                  "-schedule-scores.shtml#team_schedule",sep="")
+    
+    # Read scraped data
+    tbl <- readHTMLTable(link, stringsAsFactors = FALSE)
+    tbl <- tbl[[1]]
+    
+    # Create variables
+    dayofWeek <- str_split_fixed(tbl$Date, ", ", 2)
+    date <- str_split_fixed(dayofWeek[,c(2)], " ", 2)
+    dayofWeek <- dayofWeek[,c(1)]
+    tbl <- tbl[,c(1,3:20)]
+    
+    # Merge into a table
+    tbl[c("DayofWeek","Month","Day")] <- NA
+    tbl$DayofWeek <- dayofWeek
+    tbl$Month <- date[,c(1)]
+    tbl$Day <- date[,c(2)]
+    
+    # Rename columns
+    names(tbl) <- c('game_num', 'year', 'team', 
+                'home', 'opp_code', 'win_loss', 
+                'runs', 'runs_against', 'innings', 'win_loss_record', 
+                'rank', 'games_behind', 
+                'win_pitcher', 'loss_pitcher', 'save_pitcher', 
+                'time', 'day_night', 'attendance', 'streak',
+                'day_of_week', 'month', 'day')
+    
+    # Add year / date data
+    tbl <- tbl %>%
+      mutate(year = years)
+    
+    tbl[c("date")] <- NA
+    tbl$date <- tolower(paste(tbl$year, tbl$month, tbl$day, sep=""))
+    tbl <- tbl[,c(1,2,20:23,3:19)]
+
+    # Bind into one table
+    gamedata <- rbind(gamedata,tbl)
+                 }
+}
+
+# Remove blank rows in the dataset
+gamedata <- gamedata[gamedata$game_num !="Gm#", ]
+
+# Convert data types for use in modeling
+gamedata <- gamedata %>%
+  mutate(game_num = as.numeric(game_num),
+         year = as.numeric(year),
+         day = as.numeric(day),
+         date = as.Date(date, "%Y%b%d"),
+         runs = as.numeric(runs),
+         runs_against = as.numeric(runs_against),
+         innings = as.numeric(innings),
+         rank = as.numeric(rank),
+         attendance = as.numeric(attendance)
+         )
+
+# Create home game indicator
+gamedata <- gamedata %>%
+  mutate(home = replace(home, home == '@', 'No'),
+         home = replace(home, home == '', 'Yes'))
+
+# Separate win-loss record
+gamedata <- gamedata %>%
+  mutate(wins   = as.numeric(str_split_fixed(gamedata$win_loss_record, '-', 2)[, 1]),
+         losses = as.numeric(str_split_fixed(gamedata$win_loss_record, '-', 2)[, 2]),
+         win_diff = wins - losses,
+         win_pct  = wins / (wins + losses))
+
+# Sort the data
+gamedata <- gamedata %>%
+  arrange(team, year, date)
+
+# Check for NAs by column
+gamedata %>% 
+  apply(2, function(x) {sum(is.na(x))}) %>% 
+  as.data.frame()
+
+# Subset game data for merging
+gamedata_subset <- gamedata %>%
+  dplyr::select(-game_num, -day_of_week, -month, -day, -day_night, -time,
+         -games_behind, -innings, -attendance, -win_loss_record)
+
+# Isolate mlb data
+mlb_data <- gamedata_subset %>% 
+  filter(team == 'mlb') %>%
+  dplyr::select(-team, -opp_code) %>%
+  distinct(year, date, .keep_all = TRUE)
+
+# Standardize column names
+names(mlb_data)[3:ncol(mlb_data)] <- paste0('mlb_', names(mlb_data)[3:ncol(mlb_data)])
+
+# Add mlb homespan streak
+mlb_data$mlb_homespan <- sequence(rle(as.character(mlb_data$mlb_home))$lengths)
+mlb_data <- mlb_data %>%
+  mutate(mlb_homespan = replace(mlb_homespan, mlb_home == 'No', 0))
+
+# Isolate opponent data
+opp_data <- gamedata_subset %>% 
+  filter(team != 'mlb') %>%
+  dplyr::select(year, date, team, streak, wins, losses, win_diff, win_pct) %>%
+  distinct(year, date, team, .keep_all = TRUE)
+
+# Add pre-fix to column names
+names(opp_data)[4:ncol(opp_data)] <- paste0('opp_', names(opp_data)[4:ncol(opp_data)])
+
+# Filter data to not include mlb, use the most recent row to fill-in daily gaps between game days (important for the matching process on each day)
+opp_data_expanded <- data.frame()
+for (tm in team_list[team_list != 'mlb']){
+  piece    <- opp_data %>% filter(team == tm)
+  expanded <- data.frame(date = seq.Date(min(piece$date), 
+                                         max(piece$date), by = 'd'))
+  expanded <- expanded %>% 
+    left_join(piece, by = 'date') %>%
+    lapply(zoo::na.locf) %>% 
+    as.data.frame() %>%
+    mutate(date = date + 1) # Offset to correct for game data being EOD for each date
+  
+  opp_data_expanded <- rbind(opp_data_expanded, expanded)
+}
+
+# Rename team column in opponent subset
+opp_data_expanded <- opp_data_expanded %>%
+  rename(opp_code = team)
+
+# Merge both mlb and opponent data with our master file
+sales_master <- sales_master %>%
+  left_join(mlb_data, by = c('year', 'date')) %>%
+  left_join(opp_data_expanded, by = c('year', 'date', 'opp_code'))
+
+# View a game-by-game summary of our final dataset. NOTE: we'd expect to see NA values for a) unpulled years in years_range and b) exhibition games (which start with "XG")
+sales_master_summary <- sales_master %>% 
+  dplyr::select(event_code, date, dplyr::contains('mlb_'), dplyr::contains('opp_')) %>%
+  group_by_(.dots = c('event_code', 'date', names(sales_master)[str_detect(names(sales_master), 'mlb_|opp_')])) %>% 
+  summarize(count = n())
+
+```
+
+# Preparing Data for Modeling
+
+We filter our data to only include the seasons we care about (in this case, we chose to only include data from 2015-2016 to counter the effects of duration dependence).
+```{r}
+# Filter data to only include prior to years of data
+tix <- sales_master %>% filter(date >= season_start) # 2015-2016 season start
+
+# Refactor variables for modeling purposes
+tix <- as.data.frame(lapply(tix, function (x) if (is.factor(x)) factor(x, ordered = F) else x))
+
+```
+
+Next, we split our datasets by ticket type (Single, Group, and Special Event) and group the data appropriately for our analysis.
+```{r}
+# Initalize loop
+for(i in tix_type){
+  # Create tibbles to house data
+  assign(paste0("tix_cum_", i),tibble())
+  assign(paste0("tix_", i),tibble())
+  
+  # Filter data
+  assign(paste0("tix_", i), filter(tix, buyer_type_group_code == i))
+  
+  
+  # Group variables appropriately
+  assign(paste0("tix_cum_",i), group_by(get(paste0("tix_",i)), buyer_type_group_code,
+             opening_day, 
+             event_code, 
+             day, 
+             time, 
+             spc_event_cat, 
+             mlb_win_loss, 
+             mlb_runs, 
+             mlb_runs_against, 
+             mlb_rank, 
+             mlb_loss_pitcher, 
+             mlb_save_pitcher, 
+             mlb_streak,
+             mlb_wins, 
+             mlb_losses, 
+             mlb_win_diff, 
+             mlb_win_pct, 
+             opp_streak,
+             mlb_homespan,
+             opp_wins, 
+             opp_losses, 
+             opp_win_diff, 
+             opp_win_pct, 
+             event_date, 
+             day_night, 
+             day_type,
+             div_rival, 
+             month, 
+             result,
+             opp_code,
+             opp_type) %>%
+      dplyr::summarize(ntix = n(), 
+                       mean_price = mean(total_price)))
+}  
+```
+
+We trim our dataset to only include the modeling features we're interested in using (defined by model_variables).
+```{r}
+# Select the features we want to use for both sets of data (NOTE: code was moved to beginning of file to enable users to define parameters upfront)
+model_variables_SPCEVT <- c(model_variables, "spc_event_cat") # We need to include special event categories where applicable
+
+# Filter datasets using these variables
+for(i in tix_type){
+  # We need to treat SPCEVT differently, so let's use an if() function
+  if(i == "SPCEVT"){
+    as.factor(get(paste0("tix_cum_", i))$month)
+    assign(paste0("tix_cum_fil_", i), get(paste0("tix_cum_", i))[, model_variables_SPCEVT])
+  } else {
+    as.factor(get(paste0("tix_cum_", i))$month)
+    assign(paste0("tix_cum_fil_", i), get(paste0("tix_cum_", i))[, model_variables])
+  }
+}
+
+```
+
+We automate the model.matrix and feature creation processes to save time.
+```{r}
+# Loop through each game type. This code works when you run it twice, so we've built in code to do this automatically and workaround an error we were seeing.
+for(i in tix_type){
+  mod_name <- paste0("tix_cum_fil_", i)
+  
+   # Use modex.matrix to convert factors into quantitative indicators
+  tryCatch({assign(mod_name, as.data.frame(model.matrix(~., get(mod_name)))[,-1])}, error = function(e){})# NOTE: [,-1] simply drops the intercept column
+    
+  # Remove dashes that can disrupt model processes
+  colnames(tix_cum_fil_SINGLE) <- gsub("-", "_", colnames(tix_cum_fil_SINGLE))
+  colnames(tix_cum_fil_GROUP) <- gsub("-", "_", colnames(tix_cum_fil_GROUP))
+  colnames(tix_cum_fil_SPCEVT) <- gsub("-", "_", colnames(tix_cum_fil_SPCEVT))
+  
+  # Create feature string for each model
+  assign(paste0("feats", i), names(get(mod_name)[,-c(1)]))
+  assign(paste0("feats", i), paste(get(paste0("feats", i)), collapse = ' + '))
+  assign(paste0("feats", i), as.formula(paste('ntix ~', get(paste0("feats", i)))))
+}
+
+```
+
+# Lastly, we prepare prior projections for comparison
+```{r}
+
+# Rename buyer_type_group_code
+project2016$buyer_type_group_code[project2016$buyer_type_group_code == "Single "] <- "SINGLE"
+project2016$buyer_type_group_code[project2016$buyer_type_group_code == "Groups"] <- "GROUP"
+project2016$buyer_type_group_code[project2016$buyer_type_group_code == "Spec Evt"] <- "SPCEVT"
+
+# Aggregate predictions by opponent and category
+project2016 %>%
+  group_by(opp_code, buyer_type_group_code) %>%
+  summarize(ntix = sum(ntix))
+
+
+```
+
+# Model Building
+
+We are finally ready to begin modeling! In this loop, we run four different models for each of our datasets: a multivariate linear regression, a tuned multivariate linear regression, a negative binomial regression, and a gradient-boosted Random Forest model. 
+
+First, we run the multivariate linear regression using ten different sample sets.
+```{r}
+# Initialize data frame to store results
+results <- data_frame(buyer_type = NA, MSE = NA, OOS_MAPE = NA, OOS_MdAPE = NA, IS_MdAPE = NA)
+
+# Initialize loop
+for(i in tix_type){
+  
+  # Assign datasets and features to variables
+  mod_name <- get(paste0("tix_cum_fil_", i))
+  features <- get(paste0("feats", i))
+  
+  # Randomly select 10 different sets of sample games
+  for(j in 1:num_its) {
+    set.seed(j)
+    inTrain = createDataPartition(mod_name$ntix, p = .8, list=FALSE)
+    training <- mod_name[inTrain,]
+    validation <- mod_name[-inTrain,]
+    
+    # Run regression
+    glm.fit <- glm(features, data = training)
+    
+    # Store for ANOVA analysis
+    assign(paste0("glm.fit", i), glm.fit)
+    
+    # Predict OOS results
+    pred <- predict(glm.fit, validation, type= "response")
+    actuals <- validation$ntix
+    
+    # Find out-of-sample error terms and store in results table    
+    results[nrow(results)+1,1] <- i
+    results[nrow(results),2] <- sum((actuals-pred)^2)/nrow(validation) # Mean-squared error (MSE)
+    results[nrow(results),3] <- mean(abs((pred - actuals))/actuals) # Out-of-sample Mean Average Percent Error (OOS MAPE)
+    results[nrow(results),4] <- median(abs((pred - actuals))/actuals) # Out-of-sample Median Average Percent Error (OOS MdAPE)
+    
+    # Find in-sample error terms and store in results table
+    pred <- predict(glm.fit, training, type= "response")
+    actuals <- training$ntix
+    results[nrow(results),5] <- median(abs((pred - actuals))/actuals) # In-sample Median Average Percent Error (MdAPE)
+    }
+}
+
+# Find the mean of error terms across each buyer type
+results_glm <- aggregate(results[, 2:5], list(results$buyer_type), mean)
+
+```
+
+Second, we run the cross-validated multivariate linear regression using 10 different sample sets. Setting alpha equal to 0.99 favors parsimony of LASSO (alpha = 1) but provides ridge (alpha = 0) a chance to include some variables that have predictive power.
+```{r}
+# Initialize results dataframe
+results <- data_frame(buyer_type = NA, MSE = NA, OOS_MAPE = NA, OOS_MdAPE = NA, IS_MdAPE = NA)
+
+
+# Loop through each buyer_group
+for(i in tix_type){
+  mod_name <- get(paste0("tix_cum_fil_", i))
+  features <- get(paste0("feats", i))
+  
+  # Loop through 10 different sets of training / testing data
+  for(j in 1:num_its) {
+    set.seed(j)
+    inTrain = createDataPartition(mod_name$ntix, p = .8, list=FALSE)
+    training <- mod_name[inTrain,]; validation <- mod_name[-inTrain,]
+    
+    # Set x and y values for cross-validation
+    X <- model.matrix(ntix~., data=mod_name)[, -1] #take out column of 1's
+    Y <- mod_name$ntix 
+    
+    # Select Lambda
+    set.seed(1)
+    fit.cv <- cv.glmnet(X, Y, alpha=.99, nfolds=10)
+    
+    # Fit the regression using minimized lambda coefficient
+    coef.min <- coef(fit.cv, s="lambda.min")
+    fit.lambda <- glmnet(X, Y, alpha=.99, lambda= fit.cv$lambda.min )
+    coef.min <- coef.min[which(coef.min !=0),] # pull out the coefficients that are nonzero
+    variables <- rownames(as.matrix(coef.min))
+    formula <- as.formula(paste("ntix", "~", paste(variables[-1], collapse = "+")))
+    cv.glm.fit <- glm(formula, data = training)
+    
+    # Predict results
+    pred <- predict(cv.glm.fit, validation, type= "response")
+    actuals <- validation$ntix
+    
+    # Store OOS error terms
+    results[nrow(results)+1,1] <- i
+    results[nrow(results),2] <- sum((actuals-pred)^2)/nrow(validation) # MSE
+    results[nrow(results),3] <- mean(abs((pred - actuals))/actuals) # OOS_MAPE
+    results[nrow(results),4] <- median(abs((pred - actuals))/actuals) # OOS_MdAPE
+    
+    # Store IS error terms
+    pred <- predict(cv.glm.fit, training, type= "response")
+    actuals <- training$ntix
+    results[nrow(results),5] <- median(abs((pred - actuals))/actuals) # IS_MdAPE
+    }
+}
+
+# Find mean of error terms 
+results_cv.glm <- aggregate(results[, 2:5], list(results$buyer_type), mean)
+```
+
+Third, we run the negative binomial regression using 10-fold cross-validation.
+```{r}
+
+# Load MASS package for NBD model (can mess with dplyr, so we're loading this one package at the end)
+pacman::p_load(MASS)
+
+# Initialize results table 
+results <- data_frame(buyer_type = NA, MSE = NA, OOS_MAPE = NA, OOS_MdAPE = NA, IS_MdAPE = NA)
+
+# Initialize data frame to store results
+for(i in tix_type){
+  mod_name <- get(paste0("tix_cum_fil_", i))
+  features <- get(paste0("feats", i))
+  
+  # Select 10 different samples for test / training split
+  for(j in 1:num_its) {
+    set.seed(j)
+    inTrain = createDataPartition(mod_name$ntix, p = .8, list=FALSE)
+    training <- mod_name[inTrain,]; validation <- mod_name[-inTrain,]
+    
+    # Fit NBD regression
+    nbd.fit <- glm.nb(features, data = training)
+    
+    # Predict OOS error terms
+    pred <- predict(nbd.fit, validation, type= "response")
+    actuals <- validation$ntix
+    
+    # Store OOS results    
+    results[nrow(results)+1,1] <- i
+    results[nrow(results),2] <- sum((actuals-pred)^2)/nrow(validation) # MSE
+    results[nrow(results),3] <- mean(abs((pred - actuals))/actuals) # OOS_MAPE
+    results[nrow(results),4] <- median(abs((pred - actuals))/actuals) # OOS_MdAPE
+    
+    # Store IS results
+    pred <- predict(nbd.fit, training, type= "response")
+    actuals <- training$ntix
+    results[nrow(results),5] <- median(abs((pred - actuals))/actuals) # IS_MdAPE
+  }
+}
+
+# Create final results table
+results_nbd <- aggregate(results[, 2:5], list(results$buyer_type), mean)
+
+```
+
+Finally, we run our Random Forest model.
+```{r}
+
+# Initialize results
+results <- data_frame(buyer_type = NA, MSE = NA, OOS_MAPE = NA, OOS_MdAPE = NA, IS_MdAPE = NA)
+
+# Loop through each buyer_group
+for(i in tix_type){
+  mod_name <- get(paste0("tix_cum_fil_", i))
+  features <- get(paste0("feats", i))
+  
+  # Loop through 10 different sets of test / training data
+  for(j in 1:num_its) {
+    set.seed(j)
+    inTrain = createDataPartition(mod_name$ntix, p = .8, list=FALSE)
+    training <- mod_name[inTrain,]; 
+    validation <- mod_name[-inTrain,]
+   
+    # Fit model
+    rf.fit <- randomForest(features, data = training)
+    # Tried looping all mtry values, found that the default was sufficient 
+  
+    # Predict results
+    pred <- predict(rf.fit, validation, type= "response")
+    actuals <- validation$ntix
+    
+    # Store OOS error terms    
+    results[nrow(results)+1,1] <- i
+    results[nrow(results),2] <- sum((actuals-pred)^2)/nrow(validation) # MSE
+    results[nrow(results),3] <- mean(abs((pred - actuals))/actuals) # OOS_MAPE
+    results[nrow(results),4] <- median(abs((pred - actuals))/actuals) # OOS_MdAPE
+    
+    # Store IS error terms
+    pred <- predict(rf.fit, training, type= "response")
+    actuals <- training$ntix
+    results[nrow(results),5] <- median(abs((pred - actuals))/actuals) # IS_MdAPE
+    }
+}
+
+# Build table of results
+results_rf <- aggregate(results[, 2:5], list(results$buyer_type), mean)
+
+```
+
+Lastly, we create a summary table to describe the error terms of our models. 
+```{r eval = FALSE}
+# Report results
+mod_names <- c("glm", "nbd", "cv.glm", "rf")
+
+for(i in mod_names){
+  assign(paste0("x_", i), cbind(i, get(paste0("results_", i))))
+}
+
+# Bind rows and show completed table
+results <- rbind(x_glm, x_cv.glm, x_nbd, x_rf)
+results
+
+```
