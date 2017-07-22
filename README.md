@@ -9,7 +9,6 @@ In Spring 2017, the Wharton Analytics Fellows were tasked with helping a MLB bas
   * How do ticket sales vary over time?
   * How are ticket sales concentrated for each group?
   * When do Group sales drop-off?
-  * ... and others
 
 Specific names, data sources, and insights have been withheld to preserve our client's privacy.
 
