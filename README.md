@@ -40,7 +40,7 @@ Specific names, data sources, and insights have been withheld to preserve our cl
     * Though the boosted Random Forest’s error terms were slightly better, we’d prefer not to use a “black box” model due to its uninterpretable results
     * The NBD regression is relatively simple to implement; many different tools and technologies can automatically run this type of model (e.g., Excel)
     * Our selected model and features are well-aligned with academic research within this space (Fader, Suher, etc.)
-    * There wasn’t much variation in percent error between model types across our three ticket categories, as depicted below
+    * There wasn’t much variation in percent error between model types across our three ticket categories
 * **Develop user-friendly engine** (called "Final Model")
    * Automate formulas
    * Remove excess steps / features
