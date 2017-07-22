@@ -1,4 +1,4 @@
-# Predicting Ticket Sales by Category for a MLB Team
+# Predicting MLB Ticket Sales by Category
 ## Introduction
 In Spring 2017, the Wharton Analytics Fellows were tasked with helping a MLB baseball team answer the following question: how can we predict and optimize the number of tickets sold across our various ticket categories (group tickets, special event tickets, etc.)? To answer this question, we tested a variety of different models and features before building a predictive engine in R that could intake user inputs and forecast ticket sales over time. As a result of this engagement, our client was able to:
 
