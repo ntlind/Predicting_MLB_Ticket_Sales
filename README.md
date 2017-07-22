@@ -13,6 +13,7 @@ In Spring 2017, the Wharton Analytics Fellows were tasked with helping a MLB bas
 Specific names, data sources, and insights have been withheld to preserve our client's privacy.
 
 ## Approach
+* **Frame business issue and explore available data**
 * **Load data sources**
   * Join tables
   * Set parameters
@@ -49,11 +50,10 @@ Specific names, data sources, and insights have been withheld to preserve our cl
   
 ## Code Descriptions
 There are two R files in this repository:
-* **Model Selection** - Test OOS MAPE of multiple models before choosing the best fit
-* **Final Model** - Intake user inputs via .csv before making final forecasts using the NBD regression
+* **"Model Selection"** - Test OOS MAPE of multiple models before choosing the best fit
+* **"Final Model"** - Intake user inputs via .csv before making final forecasts using the NBD regression
 
 ## Potential Improvements
 * Scale ticket sales to limit effects of outliers and improve computational performance
 * Test more sophisticated models (e.g., RNNs)
 * Trim code for efficiency
-
