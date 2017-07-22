@@ -8,12 +8,11 @@ In Spring 2017, the Wharton Analytics Fellows were tasked with helping a MLB bas
   * Do specific features, such as our team's win record, have a significant impact on ticket sales?
   * How do ticket sales vary over time?
   * How are ticket sales concentrated for each group?
-  * When do Group sales drop-off?
+  * At what point in time do group sales drop-off?
 
 Specific names, data sources, and insights have been withheld to preserve our client's privacy.
 
 ## Approach
-### Start with "Model Selection" Code
 * **Load data sources**
   * Join tables
   * Set parameters
@@ -38,7 +37,6 @@ Specific names, data sources, and insights have been withheld to preserve our cl
   * Examine predicted vs. actual plots to visually inspect fit
   * Review forecasts to ensure they align with non-time-varying estimates
   * Select final model (NBD)
-   * Decision rationale
     * Though the boosted Random Forest’s error terms were slightly better, we’d prefer not to use a “black box” model due to its uninterpretable results
     * The NBD regression is relatively simple to implement; many different tools and technologies can automatically run this type of model (e.g., Excel)
     * Our selected model and features are well-aligned with academic research within this space (Fader, Suher, etc.)
@@ -51,8 +49,8 @@ Specific names, data sources, and insights have been withheld to preserve our cl
   
 ## Code Descriptions
 There are two R files in this repository:
-* **Model Selection** - Test OOS MAPE of multiple models before choosing the best fit.
-* **Final Model** - Intake user inputs via .csv before making final forecasts using the NBD regression.
+* **Model Selection** - Test OOS MAPE of multiple models before choosing the best fit
+* **Final Model** - Intake user inputs via .csv before making final forecasts using the NBD regression
 
 ## Potential Improvements
 * Scale ticket sales to limit effects of outliers and improve computational performance
