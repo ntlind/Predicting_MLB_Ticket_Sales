@@ -29,7 +29,7 @@ sales_data <- read.csv('tblTDC_SalesDetails_Wharton.csv')
 # Load schedule master
 schedule_master <- read.csv('Multi_Season_Schedule_Master - Updated.csv')
 
-# Read-in 2016 projections from Rocky and organize
+# Read-in 2016 projections and organize
 project2016 <- read_excel('2016 Building Block Initial Projections.xlsx', sheet = 1)
   project2016 <- project2016 %>%
     gather(buyer_type_group_code, ntix, Season:Total) %>%
